@@ -16,7 +16,7 @@ impl PixelGrid {
 
 		let values: Vec<Pixel> = frame
 			.to_bytes()
-			.into_iter()
+			.iter()
 			.array_chunks()
 			.map(|v: [&u8; 3]| Pixel::new(*v[0], *v[1], *v[2]))
 			.collect();
@@ -54,7 +54,7 @@ impl PixelGrid {
 		&mut self.values[(x + y * self.width) as usize]
 	}
 
-	pub fn iter_mut<'a>(&'a mut self) -> IterMut<'a, Pixel> {
+	pub fn iter_mut(&mut self) -> IterMut<Pixel> {
 		self.values.iter_mut()
 	}
 

@@ -7,6 +7,7 @@ use pixel::Pixel;
 use pixel_grid::PixelGrid;
 
 use std::borrow::Cow;
+use std::cell;
 use std::error::Error;
 use std::simd::{Simd, SimdFloat};
 use std::sync::{Arc, Mutex};
@@ -15,13 +16,13 @@ use glium::Surface;
 use uvc::{Context, Frame};
 
 fn gaussian_blur(grid: &PixelGrid) -> PixelGrid {
-	let mut interum = PixelGrid::from(grid.clone());
+	let mut interum = grid.clone();
 
 	let weights = [
-		Simd::from([0.106288522, 0.106288522, 0.106288522, 1.0]),
-		Simd::from([0.140321344, 0.140321344, 0.140321344, 1.0]),
-		Simd::from([0.165770069, 0.165770069, 0.165770069, 1.0]),
-		Simd::from([0.175240144, 0.175240144, 0.175240144, 1.0]),
+		Simd::from([0.10628852, 0.10628852, 0.10628852, 1.0]),
+		Simd::from([0.14032134, 0.14032134, 0.14032134, 1.0]),
+		Simd::from([0.16577006, 0.16577006, 0.16577006, 1.0]),
+		Simd::from([0.17524014, 0.17524014, 0.17524014, 1.0]),
 	];
 
 	for (x, y) in grid.coords_in_order() {
@@ -52,18 +53,46 @@ fn gaussian_blur(grid: &PixelGrid) -> PixelGrid {
 	interum
 }
 
+fn bernson_lookup(grid: &PixelGrid, cell_width: u32, sample_distance: u32) -> PixelGrid {
+	let horz_cells = grid.height() / cell_width;
+	let vert_cells = grid.width() / cell_width;
+	let mut cell_container = grid.clone();
+
+	for (x, y) in grid.coords_in_order() {
+		let mut min = f32::MAX;
+		let mut max = f32::MIN;
+		for yy in 0..cell_width / sample_distance {
+			for xx in 0..cell_width / sample_distance {
+				min = min.min(
+					grid.get(
+						(x + xx * sample_distance - cell_width / 2) as i32,
+						(y + yy * sample_distance - cell_width / 2) as i32,
+					)
+					.0[0],
+				);
+				max = max.max(
+					grid.get(
+						(x + xx * sample_distance - cell_width / 2) as i32,
+						(y + yy * sample_distance - cell_width / 2) as i32,
+					)
+					.0[0],
+				)
+			}
+		}
+		let thresh = (min + max) / 2.0;
+		*cell_container.get_mut(x as i32, y as i32) =
+			Pixel(Simd::from([thresh, thresh, thresh, thresh]));
+	}
+	cell_container
+}
+
 fn frame_to_raw_image(
 	frame: &Frame,
 ) -> Result<glium::texture::RawImage2d<'static, Pixel>, Box<dyn Error>> {
-	let new_frame = frame.to_rgb()?;
-
 	let mut grid = PixelGrid::pixel_grid_from_frame(frame);
 
 	for pixel in grid.iter_mut() {
-		let grey = (pixel.0 * Simd::from([0.299, 0.587, 0.114, 0.0]))
-			.as_array()
-			.iter()
-			.sum();
+		let grey = (pixel.0 * Simd::from([0.299, 0.587, 0.114, 0.0])).reduce_sum();
 		pixel.0[0] = grey;
 		pixel.0[1] = grey;
 		pixel.0[2] = grey;
@@ -73,50 +102,80 @@ fn frame_to_raw_image(
 
 	let gauss = gaussian_blur(&grid);
 
-	// for (x, y) in grid.coords_in_order() {
-	// 	let x = x as i32;
-	// 	let y = y as i32;
+	let local_window: usize = 10;
+	let high_freq = 5;
 
-	// 	// sobel.push((thresholdval * 255.0) as u8);
-	// 	// sobel.push((thresholdval * 255.0) as u8);
-	// 	// sobel.push((thresholdval * 255.0) as u8);
+	let low_threshhold = bernson_lookup(&gauss, 20, 4);
+	let local_thresh = bernson_lookup(&gauss, local_window as u32, 2);
+	let high_freqthresh = bernson_lookup(&gauss, high_freq, 1);
 
-	// 	let mut pixel = *grid.get(x, y);
+	let mut last_pixel = Pixel::new(255, 255, 255);
+	for (x, y) in grid.coords_in_order() {
+		let x = x as i32;
+		let y = y as i32;
+		// sobel.push((thresholdval * 255.0) as u8);
+		// sobel.push((thresholdval * 255.0) as u8);
+		// sobel.push((thresholdval * 255.0) as u8);
 
-	// 	let difference = (pixel.r - gauss.get(x, y).r + 1.0) / 2.0;
-	// 	if pixel.r > gauss.get(x, y).r {
-	// 		pixel.r = difference;
-	// 		pixel.g = difference;
-	// 		pixel.b = difference;
-	// 	} else {
-	// 		pixel.r = difference;
-	// 		pixel.g = difference;
-	// 		pixel.b = difference;
-	// 	}
-	// 	sobel.append(&mut pixel.as_bytes().to_vec());
-	// }
+		let mut pixel = *grid.get(x, y);
 
-	for y in 0..frame.height() as i32 {
-		for x in 0..frame.width() as i32 {
-			let mut sobel_x = gauss.get(x - 1, y - 1).mul(0.25)
-				+ gauss.get(x - 1, y).mul(0.5)
-				+ gauss.get(x - 1, y + 1).mul(0.25)
-				+ gauss.get(x + 1, y - 1).mul(-0.25)
-				+ gauss.get(x + 1, y).mul(-0.5)
-				+ gauss.get(x + 1, y + 1).mul(-0.25);
-
-			let mut sobel_y = gauss.get(x - 1, y - 1).mul(0.25)
-				+ gauss.get(x, y - 1).mul(0.5)
-				+ gauss.get(x + 1, y - 1).mul(0.25)
-				+ gauss.get(x - 1, y + 1).mul(-0.25)
-				+ gauss.get(x, y + 1).mul(-0.5)
-				+ gauss.get(x + 1, y + 1).mul(-0.25);
-
-			sobel_x.set_abs();
-			sobel_y.set_abs();
-			sobel.push(sobel_x + sobel_y);
+		let vlf_diff = pixel.0[0] - low_threshhold.get(x, y).0[0];
+		let lf_diff = pixel.0[0] - local_thresh.get(x, y).0[0];
+		let hf_diff = pixel.0[0] - high_freqthresh.get(x, y).0[0];
+		let global_diff = pixel.0[0] - 0.25;
+		if hf_diff.abs() > 0.04 {
+			if hf_diff > 0.0 {
+				pixel.0 = Simd::from([1.0, 1.0, 1.0, 1.0]);
+			} else {
+				pixel.0 = Simd::from([0.0, 0.0, 0.0, 1.0]);
+			}
+		} else if lf_diff.abs() > 0.04 {
+			if lf_diff > 0.00 {
+				pixel.0 = Simd::from([1.0, 1.0, 1.0, 1.0]);
+			} else {
+				pixel.0 = Simd::from([0.0, 0.0, 0.0, 1.0]);
+			}
+		} else if vlf_diff.abs() > 0.04 {
+			if vlf_diff > 0.00 {
+				pixel.0 = Simd::from([1.0, 1.0, 1.0, 1.0]);
+			} else {
+				pixel.0 = Simd::from([0.0, 0.0, 0.0, 1.0]);
+			}
+		} else if global_diff.abs() > 0.1 {
+			if global_diff > 0.00 {
+				pixel.0 = Simd::from([1.0, 1.0, 1.0, 1.0]);
+			} else {
+				pixel.0 = Simd::from([0.0, 0.0, 0.0, 1.0]);
+			}
+		} else {
+			pixel.0 = Simd::from([0.5, 0.5, 0.5, 1.0]);
 		}
+
+		//pixel.0 /= Simd::from([2.0, 2.0, 2.0, 1.0]);
+		sobel.push(pixel);
 	}
+
+	// for y in 0..frame.height() as i32 {
+	// 	for x in 0..frame.width() as i32 {
+	// 		let mut sobel_x = gauss.get(x - 1, y - 1).mul(0.25)
+	// 			+ gauss.get(x - 1, y).mul(0.5)
+	// 			+ gauss.get(x - 1, y + 1).mul(0.25)
+	// 			+ gauss.get(x + 1, y - 1).mul(-0.25)
+	// 			+ gauss.get(x + 1, y).mul(-0.5)
+	// 			+ gauss.get(x + 1, y + 1).mul(-0.25);
+
+	// 		let mut sobel_y = gauss.get(x - 1, y - 1).mul(0.25)
+	// 			+ gauss.get(x, y - 1).mul(0.5)
+	// 			+ gauss.get(x + 1, y - 1).mul(0.25)
+	// 			+ gauss.get(x - 1, y + 1).mul(-0.25)
+	// 			+ gauss.get(x, y + 1).mul(-0.5)
+	// 			+ gauss.get(x + 1, y + 1).mul(-0.25);
+
+	// 		sobel_x.set_abs();
+	// 		sobel_y.set_abs();
+	// 		sobel.push(sobel_x + sobel_y);
+	// 	}
+	// }
 	// println!("calc:  {}", frame.width() * frame.height() * 3);
 	// println!("sobel: {}", sobel.len());
 	// println!("grid:  {}", grid.make_bytes().len());
@@ -125,8 +184,8 @@ fn frame_to_raw_image(
 	let height = grid.height();
 	let image = glium::texture::RawImage2d {
 		data: Cow::Owned(sobel),
-		width: width,
-		height: height,
+		width,
+		height,
 		format: glium::texture::ClientFormat::F32F32F32F32,
 	};
 	//::from_raw_rgba(sobel, (new_frame.width(), new_frame.height()));
@@ -142,7 +201,7 @@ fn callback_frame_to_image(
 	match image {
 		Err(x) => println!("{:#?}", x),
 		Ok(x) => {
-			let mut data = Mutex::lock(&data).unwrap();
+			let mut data = Mutex::lock(data).unwrap();
 			*data = Some(x);
 		}
 	}
@@ -259,11 +318,13 @@ fn main() {
 	let mut buffer: Option<glium::texture::SrgbTexture2d> = None;
 
 	events_loop.run(move |event, _, control_flow| {
-		if let glutin::event::Event::WindowEvent { event, .. } = event {
-			if let glutin::event::WindowEvent::CloseRequested = event {
-				*control_flow = glutin::event_loop::ControlFlow::Exit;
-				return;
-			}
+		if let glutin::event::Event::WindowEvent {
+			event: glutin::event::WindowEvent::CloseRequested,
+			..
+		} = event
+		{
+			*control_flow = glutin::event_loop::ControlFlow::Exit;
+			return;
 		}
 
 		let mut target = display.draw();
